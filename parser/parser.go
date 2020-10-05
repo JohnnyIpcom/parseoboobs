@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/hashicorp/go-multierror"
 	"github.com/ivpusic/grpool"
 	"github.com/vbauerster/mpb/v5"
 	"github.com/vbauerster/mpb/v5/decor"
@@ -141,7 +142,12 @@ func (p *Parser) Download(ctx context.Context, boobs []Boob) error {
 	pool.JobQueue <- func() {
 		defer pool.JobDone()
 
-		if err := p.downloadPreviews(ctx, progress, boobs); err != nil {
+		urls := make([]string, len(boobs))
+		for i, b := range boobs {
+			urls[i] = b.Preview
+		}
+
+		if err := p.downloadURLs(ctx, progress, "previews", urls); err != nil {
 			rerr = err
 		}
 	}
@@ -149,7 +155,12 @@ func (p *Parser) Download(ctx context.Context, boobs []Boob) error {
 	pool.JobQueue <- func() {
 		defer pool.JobDone()
 
-		if err := p.downloadHiRes(ctx, progress, boobs); err != nil {
+		urls := make([]string, len(boobs))
+		for i, b := range boobs {
+			urls[i] = fmt.Sprintf("%s/%05d%s", p.tag, b.ID, filepath.Ext(b.Preview))
+		}
+
+		if err := p.downloadURLs(ctx, progress, "hires", urls); err != nil {
 			rerr = err
 		}
 	}
@@ -268,9 +279,7 @@ func (rf readerFunc) Read(p []byte) (n int, err error) {
 	return rf(p)
 }
 
-func (p *Parser) downloadFile(ctx context.Context, bar *mpb.Bar, filepath string, url string) error {
-	defer bar.Increment()
-
+func (p *Parser) downloadURL(ctx context.Context, filepath string, url string) error {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -311,16 +320,16 @@ func (p *Parser) downloadFile(ctx context.Context, bar *mpb.Bar, filepath string
 	return nil
 }
 
-func (p *Parser) downloadPreviews(ctx context.Context, progress *mpb.Progress, boobs []Boob) error {
-	os.Mkdir("previews", os.ModePerm)
+func (p *Parser) downloadURLs(ctx context.Context, progress *mpb.Progress, dir string, urls []string) error {
+	os.Mkdir(dir, os.ModePerm)
 
 	pool := grpool.NewPool(10, 10)
 	defer pool.Release()
 
-	pool.WaitCount(len(boobs))
+	pool.WaitCount(len(urls))
 
-	name := "\x1b[32mpreviews:\x1b[0m"
-	bar := progress.AddBar(int64(len(boobs)), mpb.BarStyle("[=>-|"),
+	name := fmt.Sprintf("\x1b[32m%s:\x1b[0m", dir)
+	bar := progress.AddBar(int64(len(urls)), mpb.BarStyle("[=>-|"),
 		mpb.PrependDecorators(
 			decor.Name(name, decor.WC{W: 10, C: decor.DidentRight}),
 			decor.CountersNoUnit("%5d / %5d"),
@@ -330,83 +339,34 @@ func (p *Parser) downloadPreviews(ctx context.Context, progress *mpb.Progress, b
 		),
 	)
 
-	for i := 0; i < len(boobs); i++ {
-		b := boobs[i]
-
+	var merr *multierror.Error
+	for _, url := range urls {
 		pool.JobQueue <- func() {
-			defer pool.JobDone()
+			defer func() {
+				bar.Increment()
+
+				pool.JobDone()
+			}()
 
 			select {
 			case <-ctx.Done():
-				bar.Increment()
 				return
 			default:
 			}
 
-			urlPreview, _ := p.mediaURL.Parse(b.Preview)
-			err := p.downloadFile(
-				ctx,
-				bar,
-				fmt.Sprintf("previews/%05d%s", b.ID, filepath.Ext(b.Preview)),
-				urlPreview.String(),
-			)
-
+			u, err := p.mediaURL.Parse(url)
 			if err != nil {
+				merr = multierror.Append(merr, err)
 				return
+			}
+
+			err = p.downloadURL(ctx, fmt.Sprintf("%s/%s", dir, filepath.Base(url)), u.String())
+			if err != nil {
+				merr = multierror.Append(merr, err)
 			}
 		}
 	}
 
 	pool.WaitAll()
-	return nil
-}
-
-func (p *Parser) downloadHiRes(ctx context.Context, progress *mpb.Progress, boobs []Boob) error {
-	os.Mkdir("hires", os.ModePerm)
-
-	pool := grpool.NewPool(10, 10)
-	defer pool.Release()
-
-	pool.WaitCount(len(boobs))
-
-	name := "\x1b[32mhires:\x1b[0m"
-	bar := progress.AddBar(int64(len(boobs)), mpb.BarStyle("[=>-|"),
-		mpb.PrependDecorators(
-			decor.Name(name, decor.WC{W: 10, C: decor.DidentRight}),
-			decor.CountersNoUnit("%5d / %5d"),
-		),
-		mpb.AppendDecorators(
-			decor.Percentage(decor.WC{W: 5}),
-		),
-	)
-
-	for i := 0; i < len(boobs); i++ {
-		b := boobs[i]
-
-		pool.JobQueue <- func() {
-			defer pool.JobDone()
-
-			select {
-			case <-ctx.Done():
-				bar.Increment()
-				return
-			default:
-			}
-
-			urlHiRes, _ := p.mediaURL.Parse(fmt.Sprintf("%s/%05d%s", p.tag, b.ID, filepath.Ext(b.Preview)))
-			err := p.downloadFile(
-				ctx,
-				bar,
-				fmt.Sprintf("hiRes/%05d%s", b.ID, filepath.Ext(b.Preview)),
-				urlHiRes.String(),
-			)
-
-			if err != nil {
-				return
-			}
-		}
-	}
-
-	pool.WaitAll()
-	return nil
+	return merr.ErrorOrNil()
 }
